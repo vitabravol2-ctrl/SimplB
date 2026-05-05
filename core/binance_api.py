@@ -112,6 +112,21 @@ class BinanceAPI:
     def get_account(self, api_key: str, secret: str) -> APIResult:
         return self.request("/api/v3/account", signed=True, api_key=api_key, secret=secret)
 
+    def get_balances(self, api_key: str, secret: str, assets: list[str] | None = None) -> Dict[str, Dict[str, float]]:
+        account = self.get_account(api_key, secret).data
+        wanted = set(assets or [])
+        out: Dict[str, Dict[str, float]] = {}
+        for item in account.get("balances", []):
+            asset = item.get("asset", "")
+            if wanted and asset not in wanted:
+                continue
+            free = float(item.get("free", "0") or 0)
+            locked = float(item.get("locked", "0") or 0)
+            out[asset] = {"free": free, "locked": locked, "total": free + locked}
+        for asset in wanted:
+            out.setdefault(asset, {"free": 0.0, "locked": 0.0, "total": 0.0})
+        return out
+
     def test_connection(self, symbol: str, api_key: str = "", secret: str = "") -> Dict[str, Any]:
         checks: list[tuple[str, str]] = [("ping", "/api/v3/time"), ("market", "/api/v3/ticker/bookTicker")]
         total_latency = 0.0
@@ -120,12 +135,15 @@ class BinanceAPI:
             res = self.request(path, params=params)
             total_latency += res.latency_ms
 
+        account_status = "SKIPPED"
         if api_key and secret:
             acc = self.get_account(api_key, secret)
             total_latency += acc.latency_ms
+            account_status = "OK"
 
         return {
             "status": "OK",
             "latency_ms": round(total_latency, 1),
             "endpoint": self.current_endpoint,
+            "account": account_status,
         }
