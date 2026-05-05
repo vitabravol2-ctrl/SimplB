@@ -10,6 +10,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "auto_start": True,
     "refresh_ms": 1000,
     "monitor_state": "running",
+    "current_endpoint": "https://api.binance.com",
 }
 
 
