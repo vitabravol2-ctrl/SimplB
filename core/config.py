@@ -7,7 +7,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "api_key": "",
     "secret": "",
     "symbol": "EURIUSDT",
-    "auto_start": True,
+    "auto_start": False,
     "refresh_ms": 1000,
     "monitor_state": "running",
     "current_endpoint": "https://api.binance.com",
