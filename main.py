@@ -1,4 +1,5 @@
 import sys
+import time
 from typing import Dict
 
 from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot, Qt
@@ -185,9 +186,15 @@ class SimplBWindow(QMainWindow):
         self.qty = 0.0
         self.filled_qty = 0.0
         self.realized_pnl = 0.0
+        self.failure_reason = ""
         self.current_cycle = 0
         self.last_action = "-"
         self.filters: Dict[str, float] = {}
+        self.buy_started_at = 0
+        self.sell_started_at = 0
+        self.buy_quote_total = 0.0
+        self.sell_quote_total = 0.0
+        self.step_ticks = int(self.cfg.get("step_ticks", 1))
         self.tick_timer = QTimer(self)
         self.tick_timer.setInterval(1000)
         self.tick_timer.timeout.connect(self._trading_tick)
@@ -232,6 +239,17 @@ class SimplBWindow(QMainWindow):
         state_row.addWidget(self.value_labels["state"])
         state_row.addStretch()
         layout.addLayout(state_row)
+
+        error_row = QHBoxLayout()
+        error_title = QLabel("ERROR:")
+        error_title.setFont(mono)
+        self.value_labels["error"] = QLabel("-")
+        self.value_labels["error"].setFont(mono)
+        self.value_labels["error"].setStyleSheet("color: #ff4d4d;")
+        error_row.addWidget(error_title)
+        error_row.addWidget(self.value_labels["error"])
+        error_row.addStretch()
+        layout.addLayout(error_row)
 
         layout.addLayout(self._row(mono, "ENTRY", "entry", "EXIT", "exit"))
         pnl_row = QHBoxLayout()
@@ -284,7 +302,9 @@ class SimplBWindow(QMainWindow):
 
     def _update_trading_ui(self, state: str, error: str = ""):
         self.trading_state = state
+        self.failure_reason = error
         self.value_labels["state"].setText(state)
+        self.value_labels["error"].setText(error or "-")
         self.value_labels["entry"].setText(f"{self.entry_price:.6f}" if self.entry_price else "-")
         self.value_labels["exit"].setText(f"{self.exit_price:.6f}" if self.exit_price else "-")
         self.value_labels["pnl"].setText(f"{self.realized_pnl:+.6f}")
@@ -298,24 +318,38 @@ class SimplBWindow(QMainWindow):
             self.value_labels["state"].setStyleSheet("color: #22ff66;")
 
     def start_trading(self):
+        if self.trading_state in {"PLACING_BUY", "WAIT_BUY", "PLACING_SELL", "WAIT_SELL"}:
+            return
         try:
-            self._check_safety()
+            self._reset_cycle_values()
             self.current_cycle += 1
             self.last_action = "START_TRADING"
-            bid = float(self.last_book.get("bidPrice", "0"))
-            self.entry_price = round_price_to_tick(bid, self.filters["tick_size"])
-            order_size_usdt = float(self.cfg.get("order_size_usdt", 10))
-            self.qty = round_qty_to_step(order_size_usdt / self.entry_price, self.filters["step_size"])
-            if self.qty <= 0 or not validate_min_notional(self.qty, self.entry_price, self.filters["min_notional"]):
-                raise RuntimeError("minNotional violation after rounding")
+            self._check_safety()
             self._place_buy()
             self.tick_timer.start()
         except Exception as exc:
-            self.logger.error("ERROR %s", exc)
-            self._update_trading_ui("ERROR", str(exc))
+            self._fail(str(exc))
+
+    def _reset_cycle_values(self):
+        self.active_order_id = "-"
+        self.entry_price = 0.0
+        self.exit_price = 0.0
+        self.qty = 0.0
+        self.filled_qty = 0.0
+        self.realized_pnl = 0.0
+        self.buy_quote_total = 0.0
+        self.sell_quote_total = 0.0
+        self.buy_started_at = 0
+        self.sell_started_at = 0
+        self._update_trading_ui("IDLE")
+
+    def _fail(self, reason: str):
+        self.tick_timer.stop()
+        self.logger.error("FAILED %s", reason)
+        self._update_trading_ui("FAILED", reason)
 
     def _check_safety(self):
-        self._update_trading_ui("CHECKING")
+        self._update_trading_ui("IDLE")
         api_key = str(self.cfg.get("api_key", ""))
         secret = str(self.cfg.get("secret", ""))
         if not api_key or not secret:
@@ -324,8 +358,6 @@ class SimplBWindow(QMainWindow):
             raise RuntimeError("Only EURIUSDT allowed")
         if self.api_status != "CONNECTED":
             raise RuntimeError("Account not connected")
-        if float(self.value_labels["usdt"].text() or 0) < float(self.cfg.get("order_size_usdt", 10)):
-            raise RuntimeError("USDT balance too low")
         info = self.api.get_exchange_info(self.symbol).data["symbols"][0]
         for f in info["filters"]:
             if f["filterType"] == "PRICE_FILTER":
@@ -334,32 +366,84 @@ class SimplBWindow(QMainWindow):
                 self.filters["step_size"] = float(f["stepSize"])
             if f["filterType"] == "MIN_NOTIONAL":
                 self.filters["min_notional"] = float(f["minNotional"])
+        bid = float(self.last_book.get("bidPrice", "0") or 0)
+        ask = float(self.last_book.get("askPrice", "0") or 0)
+        if bid <= 0 or ask <= 0:
+            raise RuntimeError("no bid/ask")
+        self.entry_price = round_price_to_tick(bid, self.filters["tick_size"])
+        order_size_usdt = float(self.cfg.get("order_size_usdt", 10))
+        if order_size_usdt < self.filters["min_notional"]:
+            raise RuntimeError("minNotional")
+        self.qty = round_qty_to_step(order_size_usdt / self.entry_price, self.filters["step_size"])
+        if self.qty <= 0:
+            raise RuntimeError("qty=0 after stepSize")
+        if not validate_min_notional(self.qty, self.entry_price, self.filters["min_notional"]):
+            raise RuntimeError("minNotional after rounding")
+        balances = self.api.get_balances(str(self.cfg.get("api_key", "")), str(self.cfg.get("secret", "")), ["USDT"])
+        if balances.get("USDT", {}).get("free", 0.0) < order_size_usdt:
+            raise RuntimeError("insufficient balance")
 
     def _place_buy(self):
-        r = self.api.place_limit_buy(self.symbol, self.qty, self.entry_price, str(self.cfg.get("api_key", "")), str(self.cfg.get("secret", ""))).data
+        self._update_trading_ui("PLACING_BUY")
+        try:
+            r = self.api.place_limit_buy(self.symbol, self.qty, self.entry_price, str(self.cfg.get("api_key", "")), str(self.cfg.get("secret", ""))).data
+        except Exception as exc:
+            raise RuntimeError(f"buy rejected: {exc}") from exc
         self.active_order_id = r.get("orderId", "-")
-        self._update_trading_ui("BUY")
+        self.buy_started_at = int(time.time())
+        self.logger.info("BUY SENT id=%s qty=%s price=%s", self.active_order_id, self.qty, self.entry_price)
+        self._update_trading_ui("WAIT_BUY")
 
     def _place_sell(self):
-        r = self.api.place_limit_sell(self.symbol, self.qty, self.exit_price, str(self.cfg.get("api_key", "")), str(self.cfg.get("secret", ""))).data
+        self._update_trading_ui("PLACING_SELL")
+        try:
+            r = self.api.place_limit_sell(self.symbol, self.qty, self.exit_price, str(self.cfg.get("api_key", "")), str(self.cfg.get("secret", ""))).data
+        except Exception as exc:
+            raise RuntimeError(f"sell rejected: {exc}") from exc
         self.active_order_id = r.get("orderId", "-")
-        self._update_trading_ui("SELL")
+        self.sell_started_at = int(time.time())
+        self.logger.info("SELL SENT id=%s qty=%s price=%s", self.active_order_id, self.qty, self.exit_price)
+        self._update_trading_ui("WAIT_SELL")
 
     def _trading_tick(self):
-        if self.trading_state not in {"BUY", "SELL"}:
+        if self.trading_state not in {"WAIT_BUY", "WAIT_SELL"}:
             return
-        o = self.api.get_order(self.symbol, int(self.active_order_id), str(self.cfg.get("api_key", "")), str(self.cfg.get("secret", ""))).data
+        try:
+            o = self.api.get_order(self.symbol, int(self.active_order_id), str(self.cfg.get("api_key", "")), str(self.cfg.get("secret", ""))).data
+        except Exception as exc:
+            self._fail(f"api timeout: {exc}")
+            return
         self.filled_qty = float(o.get("executedQty", "0") or 0)
-        if o.get("status") != "FILLED":
+        status = o.get("status")
+        if status == "PARTIALLY_FILLED":
             return
-        if self.trading_state == "BUY":
+        if status == "CANCELED":
+            self._fail("order canceled")
+            return
+        if status != "FILLED":
+            now = int(time.time())
+            if self.trading_state == "WAIT_BUY" and self.buy_started_at and now - self.buy_started_at > 20:
+                self.api.cancel_order(self.symbol, int(self.active_order_id), str(self.cfg.get("api_key", "")), str(self.cfg.get("secret", "")))
+                self._fail("buy timeout")
+            if self.trading_state == "WAIT_SELL" and self.sell_started_at and now - self.sell_started_at > 30:
+                self.api.cancel_order(self.symbol, int(self.active_order_id), str(self.cfg.get("api_key", "")), str(self.cfg.get("secret", "")))
+                self._fail("sell timeout")
+            return
+        if self.trading_state == "WAIT_BUY":
             quote = float(o.get("cummulativeQuoteQty", "0") or 0)
+            self.buy_quote_total = quote
             self.entry_price = quote / max(self.filled_qty, 1e-12)
-            self.exit_price = round_price_to_tick(self.entry_price + self.filters["tick_size"], self.filters["tick_size"])
-            self._place_sell()
+            self.exit_price = round_price_to_tick(self.entry_price + (self.filters["tick_size"] * self.step_ticks), self.filters["tick_size"])
+            self.logger.info("BUY FILLED id=%s qty=%s quote=%s", self.active_order_id, self.filled_qty, self.buy_quote_total)
+            try:
+                self._place_sell()
+            except Exception as exc:
+                self._fail(str(exc))
         else:
             quote = float(o.get("cummulativeQuoteQty", "0") or 0)
-            self.realized_pnl = quote - (self.entry_price * self.filled_qty)
+            self.sell_quote_total = quote
+            self.realized_pnl = self.sell_quote_total - self.buy_quote_total
+            self.logger.info("SELL FILLED id=%s qty=%s quote=%s pnl=%s", self.active_order_id, self.filled_qty, self.sell_quote_total, self.realized_pnl)
             self.tick_timer.stop()
             self._update_trading_ui("DONE")
 
@@ -376,7 +460,7 @@ class SimplBWindow(QMainWindow):
             for o in orders:
                 self.api.cancel_order(self.symbol, int(o["orderId"]), str(self.cfg.get("api_key", "")), str(self.cfg.get("secret", "")))
         finally:
-            self._update_trading_ui("KILLED")
+            self._update_trading_ui("STOPPED")
 
     def open_settings(self):
         d = SettingsDialog(self, self.cfg, self.api)
