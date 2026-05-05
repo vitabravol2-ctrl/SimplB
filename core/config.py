@@ -12,6 +12,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "step_ticks": 1,
     "poll_ms": 1000,
     "account_poll_ms": 5000,
+    "buy_timeout_sec": 30,
+    "sell_timeout_sec": 60,
+    "reprice_enabled": True,
+    "reprice_after_sec": 10,
+    "max_cycles": 0,
+    "stop_after_loss": False,
 }
 
 
