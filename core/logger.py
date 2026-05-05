@@ -3,7 +3,7 @@ from pathlib import Path
 
 
 def setup_logger() -> logging.Logger:
-    """Configure application logger that writes to logs/app.log and stdout."""
+    """Configure application logger that writes to logs/app.log."""
     log_dir = Path("logs")
     log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -21,10 +21,5 @@ def setup_logger() -> logging.Logger:
     file_handler = logging.FileHandler(log_dir / "app.log", encoding="utf-8")
     file_handler.setFormatter(formatter)
 
-    stream_handler = logging.StreamHandler()
-    stream_handler.setFormatter(formatter)
-
     logger.addHandler(file_handler)
-    logger.addHandler(stream_handler)
-
     return logger

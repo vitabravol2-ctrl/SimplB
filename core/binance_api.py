@@ -7,8 +7,9 @@ from typing import Any, Dict
 import requests
 
 
-TIMEOUT = 2
-MAX_RETRIES = 2
+TIMEOUT = 1.5
+MAX_RETRIES = 1
+LATENCY_SWITCH_MS = 1500
 DEFAULT_ENDPOINTS = [
     "https://api.binance.com",
     "https://api1.binance.com",
@@ -32,7 +33,7 @@ class APIResult:
 
 
 class BinanceAPI:
-    def __init__(self, endpoints: list[str] | None = None, timeout: int = TIMEOUT, retries: int = MAX_RETRIES) -> None:
+    def __init__(self, endpoints: list[str] | None = None, timeout: float = TIMEOUT, retries: int = MAX_RETRIES) -> None:
         self.endpoints = endpoints or DEFAULT_ENDPOINTS.copy()
         self.current_idx = 0
         self.current_endpoint = self.endpoints[self.current_idx]
@@ -88,9 +89,14 @@ class BinanceAPI:
                     continue
 
                 response.raise_for_status()
+                if latency_ms > LATENCY_SWITCH_MS and self._switch_endpoint():
+                    switched = True
+
                 return APIResult(response.json(), latency_ms, attempt, self.current_endpoint, switched)
             except requests.RequestException as exc:
                 last_exc = exc
+                if self._switch_endpoint():
+                    switched = True
 
         raise HTTPRequestError(f"GET {path} failed after {self.retries + 1} attempts: {last_exc}")
 
