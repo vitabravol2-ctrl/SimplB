@@ -2,7 +2,8 @@ import sys
 from datetime import datetime
 from typing import Dict
 
-from PySide6.QtCore import QTimer, Qt
+from PySide6.QtCore import QTimer
+from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -13,14 +14,14 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
-    QTableWidget,
-    QTableWidgetItem,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
 from core.binance_api import BinanceAPI, HTTPRequestError
 from core.config import load_config, save_config_values
+from core.logger import setup_logger
 
 
 class SettingsDialog(QDialog):
@@ -76,6 +77,7 @@ class SettingsDialog(QDialog):
 class SimplBWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
+        self.logger = setup_logger()
         self.cfg = load_config()
         self.api = BinanceAPI()
         saved_endpoint = str(self.cfg.get("current_endpoint", self.api.current_endpoint))
@@ -85,38 +87,38 @@ class SimplBWindow(QMainWindow):
         self.symbol = str(self.cfg.get("symbol", "EURIUSDT"))
 
         self.timer = QTimer(self)
-        self.timer.setInterval(int(self.cfg.get("refresh_ms", 1000)))
+        self.timer.setInterval(1000)
         self.timer.timeout.connect(self.fetch_market_data)
 
         self.setWindowTitle("SimplB Terminal")
-        self.resize(900, 320)
+        self.resize(720, 460)
         self._build_ui()
-        self._set_status("RED", "#cc0000")
+        self._set_status("RED", "#ff4d4d")
 
     def _build_ui(self) -> None:
         root = QWidget()
+        root.setStyleSheet("background-color:#000000;color:#00ff66;")
         layout = QVBoxLayout(root)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(6)
+
+        mono = QFont("Courier New")
+        mono.setStyleHint(QFont.Monospace)
+        mono.setPointSize(10)
 
         top = QHBoxLayout()
-        self.status_label = QLabel("STATUS ● RED")
-        self.endpoint_label = QLabel(f"ENDPOINT: {self.api.current_endpoint}")
-        self.latency_label = QLabel("LATENCY: - ms")
+        self.status_label = QLabel("status: ● RED")
+        self.endpoint_label = QLabel(f"endpoint: {self.api.current_endpoint}")
+        self.latency_label = QLabel("latency: - ms")
         for w in (self.status_label, self.endpoint_label, self.latency_label):
+            w.setFont(mono)
             top.addWidget(w)
         top.addStretch(1)
         layout.addLayout(top)
 
-        self.market_table = QTableWidget(1, 8)
-        self.market_table.setHorizontalHeaderLabels(["bid", "ask", "mid", "spread", "%", "last", "vol", "qVol"])
-        self.market_table.verticalHeader().setVisible(False)
-        self.market_table.setShowGrid(False)
-        self.market_table.setAlternatingRowColors(True)
-        self.market_table.setStyleSheet("QTableWidget{font-size:11px;} QHeaderView::section{padding:2px;}")
-        self.market_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.market_table.setFocusPolicy(Qt.NoFocus)
-        layout.addWidget(self.market_table)
+        self.stream_view = QTextEdit()
+        self.stream_view.setReadOnly(True)
+        self.stream_view.setFont(mono)
+        self.stream_view.setStyleSheet("border:1px solid #00aa44;padding:6px;")
+        layout.addWidget(self.stream_view)
 
         buttons = QHBoxLayout()
         self.start_btn = QPushButton("START")
@@ -134,9 +136,10 @@ class SimplBWindow(QMainWindow):
         self.setCentralWidget(root)
 
     def _set_status(self, status: str, color: str) -> None:
-        self.status_label.setText(f"STATUS ● {status}")
-        self.status_label.setStyleSheet(f"font-weight:600;color:{color};")
-        self.endpoint_label.setText(f"ENDPOINT: {self.api.current_endpoint.replace('https://', '')}")
+        self.status_label.setText(f"status: ● {status}")
+        self.status_label.setStyleSheet(f"color:{color};font-weight:600;")
+        endpoint = self.api.current_endpoint.replace("https://", "")
+        self.endpoint_label.setText(f"endpoint: {endpoint}")
         self.cfg["current_endpoint"] = self.api.current_endpoint
         save_config_values(self.cfg)
 
@@ -153,47 +156,52 @@ class SimplBWindow(QMainWindow):
         self.fetch_market_data()
 
     def stop_monitoring(self) -> None:
-        if not self.timer.isActive():
-            return
         self.timer.stop()
 
     def fetch_market_data(self) -> None:
+        timestamp = datetime.now().isoformat(timespec="seconds")
         try:
             book = self.api.get_book_ticker(self.symbol)
             stat = self.api.get_24hr(self.symbol)
             latency = book.latency_ms + stat.latency_ms
-            row = self._prepare_row(book.data, stat.data)
-            self._update_table(row)
-            self.latency_label.setText(f"LATENCY: {latency:.1f} ms")
-            if book.switched or stat.switched or "api.binance.com" not in self.api.current_endpoint:
-                self._set_status("YELLOW", "#b8860b")
+            status_text = "YELLOW" if (book.retries_used > 0 or stat.retries_used > 0 or book.switched or stat.switched) else "GREEN"
+            payload = self._build_stream_payload(book.data, stat.data, latency, timestamp, status_text)
+            self.stream_view.setPlainText(payload)
+            self.latency_label.setText(f"latency: {latency:.1f} ms")
+            if status_text == "YELLOW":
+                self._set_status("YELLOW", "#ffdd44")
             else:
-                self._set_status("GREEN", "#0f8a0f")
-        except HTTPRequestError:
-            self._set_status("RED", "#cc0000")
+                self._set_status("GREEN", "#00ff66")
+            self.logger.info("tick ok symbol=%s endpoint=%s latency_ms=%.1f", self.symbol, self.api.current_endpoint, latency)
+        except HTTPRequestError as exc:
+            self._set_status("RED", "#ff4d4d")
+            self.logger.error("tick failed symbol=%s endpoint=%s error=%s", self.symbol, self.api.current_endpoint, exc)
 
-    def _prepare_row(self, book: Dict[str, str], stat: Dict[str, str]) -> Dict[str, str]:
+    def _build_stream_payload(self, book: Dict[str, str], stat: Dict[str, str], latency: float, timestamp: str, status: str) -> str:
         bid = float(book["bidPrice"])
         ask = float(book["askPrice"])
         mid = (bid + ask) / 2
         spread = ask - bid
         spread_pct = (spread / bid * 100) if bid else 0.0
-        _ = datetime.now().isoformat(timespec="seconds")
-        return {
-            "bid": f"{bid:.6f}",
-            "ask": f"{ask:.6f}",
-            "mid": f"{mid:.6f}",
-            "spread": f"{spread:.6f}",
-            "%": f"{spread_pct:.4f}%",
-            "last": f"{float(stat['lastPrice']):.6f}",
-            "vol": stat["volume"],
-            "qVol": stat["quoteVolume"],
-        }
+        endpoint = self.api.current_endpoint.replace("https://", "")
 
-    def _update_table(self, values: Dict[str, str]) -> None:
-        headers = ["bid", "ask", "mid", "spread", "%", "last", "vol", "qVol"]
-        for col, key in enumerate(headers):
-            self.market_table.setItem(0, col, QTableWidgetItem(values[key]))
+        return (
+            f"{self.symbol}\n"
+            "------------------------\n"
+            f"bid: {bid:.6f}\n"
+            f"ask: {ask:.6f}\n"
+            f"mid: {mid:.6f}\n"
+            f"spread: {spread:.6f}\n"
+            f"spread%: {spread_pct:.4f}%\n\n"
+            f"last: {float(stat['lastPrice']):.6f}\n"
+            f"volume: {stat['volume']}\n"
+            f"quoteVol: {stat['quoteVolume']}\n\n"
+            f"latency: {latency:.1f} ms\n"
+            f"endpoint: {endpoint}\n"
+            f"timestamp: {timestamp}\n"
+            f"status: ● {status}\n"
+            "------------------------"
+        )
 
 
 def main() -> None:
