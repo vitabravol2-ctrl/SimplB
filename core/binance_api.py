@@ -54,6 +54,7 @@ class BinanceAPI:
         signed: bool = False,
         api_key: str = "",
         secret: str = "",
+        method: str = "GET",
     ) -> APIResult:
         all_headers = DEFAULT_HEADERS.copy()
         if headers:
@@ -74,7 +75,8 @@ class BinanceAPI:
         for attempt in range(self.retries + 1):
             start = time.perf_counter()
             try:
-                response = requests.get(
+                response = requests.request(
+                    method,
                     f"{self.current_endpoint}{path}",
                     params=req_params,
                     headers=all_headers,
@@ -147,3 +149,49 @@ class BinanceAPI:
             "endpoint": self.current_endpoint,
             "account": account_status,
         }
+
+
+    def get_exchange_info(self, symbol: str) -> APIResult:
+        return self.request("/api/v3/exchangeInfo", params={"symbol": symbol})
+
+    def get_open_orders(self, symbol: str, api_key: str, secret: str) -> APIResult:
+        return self.request("/api/v3/openOrders", params={"symbol": symbol}, signed=True, api_key=api_key, secret=secret)
+
+    def place_limit_buy(self, symbol: str, quantity: float, price: float, api_key: str, secret: str) -> APIResult:
+        return self.request(
+            "/api/v3/order",
+            params={"symbol": symbol, "side": "BUY", "type": "LIMIT", "timeInForce": "GTC", "quantity": quantity, "price": price},
+            signed=True,
+            api_key=api_key,
+            secret=secret,
+            method="POST",
+        )
+
+    def place_limit_sell(self, symbol: str, quantity: float, price: float, api_key: str, secret: str) -> APIResult:
+        return self.request(
+            "/api/v3/order",
+            params={"symbol": symbol, "side": "SELL", "type": "LIMIT", "timeInForce": "GTC", "quantity": quantity, "price": price},
+            signed=True,
+            api_key=api_key,
+            secret=secret,
+            method="POST",
+        )
+
+    def cancel_order(self, symbol: str, order_id: int, api_key: str, secret: str) -> APIResult:
+        return self.request(
+            "/api/v3/order",
+            params={"symbol": symbol, "orderId": order_id},
+            signed=True,
+            api_key=api_key,
+            secret=secret,
+            method="DELETE",
+        )
+
+    def get_order(self, symbol: str, order_id: int, api_key: str, secret: str) -> APIResult:
+        return self.request(
+            "/api/v3/order",
+            params={"symbol": symbol, "orderId": order_id},
+            signed=True,
+            api_key=api_key,
+            secret=secret,
+        )
