@@ -31,11 +31,21 @@ class MarketWorker(QObject):
     error = Signal(str)
     account_error = Signal(str)
 
-    def __init__(self, symbol: str, endpoint: str, api_key: str = "", secret: str = ""):
+    def __init__(
+        self,
+        symbol: str,
+        endpoint: str,
+        api_key: str = "",
+        secret: str = "",
+        poll_ms: int = 1000,
+        account_poll_ms: int = 5000,
+    ):
         super().__init__()
         self.symbol = symbol
         self.api_key = api_key
         self.secret = secret
+        self.poll_ms = poll_ms
+        self.account_poll_ms = account_poll_ms
         self.api = BinanceAPI()
         if endpoint in self.api.endpoints:
             self.api.current_endpoint = endpoint
@@ -45,6 +55,8 @@ class MarketWorker(QObject):
         self.had_error = False
         self.market_timer = None
         self.account_timer = None
+        self.poll_ms = poll_ms
+        self.account_poll_ms = account_poll_ms
 
     @Slot()
     def start(self):
@@ -52,11 +64,11 @@ class MarketWorker(QObject):
             return
         self.running = True
         self.market_timer = QTimer(self)
-        self.market_timer.setInterval(1000)
+        self.market_timer.setInterval(self.poll_ms)
         self.market_timer.timeout.connect(self.poll_market)
         self.market_timer.start()
         self.account_timer = QTimer(self)
-        self.account_timer.setInterval(5000)
+        self.account_timer.setInterval(self.account_poll_ms)
         self.account_timer.timeout.connect(self.poll_account)
         self.account_timer.start()
         self.poll_market()
@@ -72,11 +84,13 @@ class MarketWorker(QObject):
         self.market_timer = None
         self.account_timer = None
 
-    @Slot(str, str, str)
-    def update_settings(self, symbol: str, api_key: str, secret: str):
+    @Slot(str, str, str, int, int)
+    def update_settings(self, symbol: str, api_key: str, secret: str, poll_ms: int, account_poll_ms: int):
         self.symbol = symbol
         self.api_key = api_key
         self.secret = secret
+        self.poll_ms = poll_ms
+        self.account_poll_ms = account_poll_ms
 
     @Slot()
     def poll_market(self):
@@ -131,23 +145,45 @@ class SettingsDialog(QDialog):
         self.secret_input = QLineEdit(str(cfg.get("secret", "")))
         self.secret_input.setEchoMode(QLineEdit.Password)
         self.symbol_input = QLineEdit(str(cfg.get("symbol", "EURIUSDT")))
+        self.budget_input = QLineEdit(str(cfg.get("budget_usdt", 100)))
+        self.order_size_input = QLineEdit(str(cfg.get("order_size_usdt", 10)))
+        self.step_ticks_input = QLineEdit(str(cfg.get("step_ticks", 1)))
+        self.poll_ms_input = QLineEdit(str(cfg.get("poll_ms", 1000)))
+        self.account_poll_ms_input = QLineEdit(str(cfg.get("account_poll_ms", 5000)))
         form.addRow("API KEY", self.api_key_input)
         form.addRow("SECRET", self.secret_input)
         form.addRow("SYMBOL", self.symbol_input)
+        form.addRow("Budget USDT", self.budget_input)
+        form.addRow("Order size USDT", self.order_size_input)
+        form.addRow("Step ticks", self.step_ticks_input)
+        form.addRow("Poll ms", self.poll_ms_input)
+        form.addRow("Account poll ms", self.account_poll_ms_input)
         layout.addLayout(form)
         buttons = QHBoxLayout()
         save_btn = QPushButton("SAVE")
         save_btn.clicked.connect(self.handle_save)
-        test_btn = QPushButton("TEST CONNECTION")
+        test_btn = QPushButton("TEST API")
         test_btn.clicked.connect(self.handle_test)
         buttons.addWidget(save_btn)
+        close_btn = QPushButton("CLOSE")
+        close_btn.clicked.connect(self.reject)
         buttons.addWidget(test_btn)
+        buttons.addWidget(close_btn)
         layout.addLayout(buttons)
 
     def handle_save(self):
-        self.cfg["api_key"] = self.api_key_input.text().strip()
-        self.cfg["secret"] = self.secret_input.text().strip()
-        self.cfg["symbol"] = self.symbol_input.text().strip().upper() or "EURIUSDT"
+        try:
+            self.cfg["api_key"] = self.api_key_input.text().strip()
+            self.cfg["secret"] = self.secret_input.text().strip()
+            self.cfg["symbol"] = self.symbol_input.text().strip().upper() or "EURIUSDT"
+            self.cfg["budget_usdt"] = float(self.budget_input.text().strip() or "100")
+            self.cfg["order_size_usdt"] = float(self.order_size_input.text().strip() or "10")
+            self.cfg["step_ticks"] = int(self.step_ticks_input.text().strip() or "1")
+            self.cfg["poll_ms"] = max(200, int(self.poll_ms_input.text().strip() or "1000"))
+            self.cfg["account_poll_ms"] = max(1000, int(self.account_poll_ms_input.text().strip() or "5000"))
+        except ValueError:
+            QMessageBox.critical(self, "Settings", "Invalid numeric value")
+            return
         save_config_values(self.cfg)
         self.accept()
 
@@ -195,6 +231,7 @@ class SimplBWindow(QMainWindow):
         self.buy_quote_total = 0.0
         self.sell_quote_total = 0.0
         self.step_ticks = int(self.cfg.get("step_ticks", 1))
+        self.order_size_usdt = float(self.cfg.get("order_size_usdt", 10))
         self.tick_timer = QTimer(self)
         self.tick_timer.setInterval(1000)
         self.tick_timer.timeout.connect(self._trading_tick)
@@ -265,18 +302,26 @@ class SimplBWindow(QMainWindow):
         pnl_row.addStretch()
         pnl_row.addWidget(self.value_labels["order"])
         layout.addLayout(pnl_row)
+        trade_info_row = QHBoxLayout()
+        self.value_labels["trade_info"] = QLabel("SIZE: 10.00 USDT | MIN: - | TICK: -")
+        self.value_labels["trade_info"].setFont(mono)
+        trade_info_row.addWidget(self.value_labels["trade_info"])
+        trade_info_row.addStretch()
+        layout.addLayout(trade_info_row)
 
         buttons = QHBoxLayout()
         self.start_btn = QPushButton("START")
         self.stop_btn = QPushButton("STOP")
+        self.settings_btn = QPushButton("SETTINGS")
         self.trade_btn = QPushButton("TRADE")
         self.kill_btn = QPushButton("KILL")
-        for btn in [self.start_btn, self.stop_btn, self.trade_btn, self.kill_btn]:
+        for btn in [self.start_btn, self.stop_btn, self.settings_btn, self.trade_btn, self.kill_btn]:
             buttons.addWidget(btn)
         layout.addLayout(buttons)
 
         self.start_btn.clicked.connect(self.start_monitoring)
         self.stop_btn.clicked.connect(self.stop_monitoring)
+        self.settings_btn.clicked.connect(self.open_settings)
         self.trade_btn.clicked.connect(self.start_trading)
         self.kill_btn.clicked.connect(self.emergency_stop)
 
@@ -354,8 +399,6 @@ class SimplBWindow(QMainWindow):
         secret = str(self.cfg.get("secret", ""))
         if not api_key or not secret:
             raise RuntimeError("API keys missing")
-        if self.symbol != "EURIUSDT":
-            raise RuntimeError("Only EURIUSDT allowed")
         if self.api_status != "CONNECTED":
             raise RuntimeError("Account not connected")
         info = self.api.get_exchange_info(self.symbol).data["symbols"][0]
@@ -372,8 +415,10 @@ class SimplBWindow(QMainWindow):
             raise RuntimeError("no bid/ask")
         self.entry_price = round_price_to_tick(bid, self.filters["tick_size"])
         order_size_usdt = float(self.cfg.get("order_size_usdt", 10))
+        self.order_size_usdt = order_size_usdt
+        self._update_trade_info_label()
         if order_size_usdt < self.filters["min_notional"]:
-            raise RuntimeError("minNotional")
+            raise RuntimeError(f"order_size < minNotional: {order_size_usdt:g} < {self.filters['min_notional']:g}")
         self.qty = round_qty_to_step(order_size_usdt / self.entry_price, self.filters["step_size"])
         if self.qty <= 0:
             raise RuntimeError("qty=0 after stepSize")
@@ -467,12 +512,22 @@ class SimplBWindow(QMainWindow):
         if d.exec():
             self.cfg = load_config()
             self.symbol = str(self.cfg.get("symbol", "EURIUSDT"))
+            self.step_ticks = int(self.cfg.get("step_ticks", 1))
+            self.order_size_usdt = float(self.cfg.get("order_size_usdt", 10))
+            self._update_trade_info_label()
 
     def start_monitoring(self):
         if self.worker_thread and self.worker_thread.isRunning():
             return
         self.worker_thread = QThread(self)
-        self.worker = MarketWorker(self.symbol, self.api.current_endpoint, str(self.cfg.get("api_key", "")), str(self.cfg.get("secret", "")))
+        self.worker = MarketWorker(
+            self.symbol,
+            self.api.current_endpoint,
+            str(self.cfg.get("api_key", "")),
+            str(self.cfg.get("secret", "")),
+            int(self.cfg.get("poll_ms", 1000)),
+            int(self.cfg.get("account_poll_ms", 5000)),
+        )
         self.worker.moveToThread(self.worker_thread)
         self.worker_thread.started.connect(self.worker.start)
         self.stop_worker_signal.connect(self.worker.stop)
@@ -523,6 +578,13 @@ class SimplBWindow(QMainWindow):
         self.logger.error(m)
         self.value_labels["state"].setText("ERROR")
         self.value_labels["state"].setStyleSheet("color: #ff4d4d;")
+
+    def _update_trade_info_label(self):
+        min_notional = self.filters.get("min_notional")
+        tick_size = self.filters.get("tick_size")
+        min_txt = f"{min_notional:g}" if min_notional else "-"
+        tick_txt = f"{tick_size:g}" if tick_size else "-"
+        self.value_labels["trade_info"].setText(f"SIZE: {self.order_size_usdt:.2f} USDT | MIN: {min_txt} | TICK: {tick_txt}")
 
 
 if __name__ == "__main__":
