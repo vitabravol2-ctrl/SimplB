@@ -11,6 +11,26 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "ws_url": "wss://stream.binance.com:9443/ws/btcusdt@bookTicker",
     "http_endpoint": "https://api.binance.com",
     "ui_refresh_ms": 250,
+    "api_key": "",
+    "api_secret": "",
+    "account_poll_ms": 3000,
+    "show_balances": True,
+    "active_algorithm": "BasicScalper",
+    "algorithms": {
+        "BasicScalper": {
+            "enabled": False,
+            "order_size_usdt": 20.0,
+            "take_profit_usdt": 5.0,
+            "stop_loss_usdt": 5.0,
+            "max_cycles": 20,
+            "cooldown_sec": 10,
+            "fee_bps": 10,
+            "allow_martingale": False,
+            "martingale_multiplier": 2.0,
+            "max_martingale_steps": 3,
+            "max_spread": 5.0,
+        }
+    },
 }
 
 
@@ -28,6 +48,10 @@ def load_config() -> dict[str, Any]:
 
     merged = DEFAULT_CONFIG.copy()
     merged.update(data)
+    if "algorithms" not in merged:
+        merged["algorithms"] = DEFAULT_CONFIG["algorithms"]
+    if "BasicScalper" not in merged["algorithms"]:
+        merged["algorithms"]["BasicScalper"] = DEFAULT_CONFIG["algorithms"]["BasicScalper"].copy()
     return merged
 
 
