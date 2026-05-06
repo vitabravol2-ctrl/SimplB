@@ -1,8 +1,6 @@
 {
-  "api_key": "",
-  "secret": "",
-  "symbol": "EURIUSDT",
-  "auto_start": true,
-  "refresh_ms": 1000,
-  "monitor_state": "running"
+  "symbol": "BTCUSDT",
+  "ws_url": "wss://stream.binance.com:9443/ws/btcusdt@bookTicker",
+  "http_endpoint": "https://api.binance.com",
+  "ui_refresh_ms": 250
 }
