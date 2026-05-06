@@ -1,51 +1,38 @@
+from __future__ import annotations
+
 import json
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any
 
 CONFIG_PATH = Path("config.json")
-DEFAULT_CONFIG: Dict[str, Any] = {
-    "api_key": "",
-    "secret": "",
-    "symbol": "EURIUSDT",
-    "budget_usdt": 100.0,
-    "order_size_usdt": 10.0,
-    "step_ticks": 1,
-    "poll_ms": 1000,
-    "account_poll_ms": 5000,
-    "buy_timeout_sec": 30,
-    "sell_timeout_sec": 60,
-    "reprice_enabled": True,
-    "reprice_after_sec": 10,
-    "max_cycles": 0,
-    "stop_after_loss": False,
+
+DEFAULT_CONFIG: dict[str, Any] = {
+    "symbol": "BTCUSDT",
+    "ws_url": "wss://stream.binance.com:9443/ws/btcusdt@bookTicker",
+    "http_endpoint": "https://api.binance.com",
+    "ui_refresh_ms": 250,
 }
 
 
-def load_config() -> Dict[str, Any]:
-    """Load config from config.json and merge with defaults."""
+def load_config() -> dict[str, Any]:
     if not CONFIG_PATH.exists():
+        save_config(DEFAULT_CONFIG)
         return DEFAULT_CONFIG.copy()
 
     try:
-        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-        merged = DEFAULT_CONFIG.copy()
-        if isinstance(data, dict):
-            merged.update(data)
-        return merged
+        with CONFIG_PATH.open("r", encoding="utf-8") as file:
+            data = json.load(file)
     except (json.JSONDecodeError, OSError):
+        save_config(DEFAULT_CONFIG)
         return DEFAULT_CONFIG.copy()
 
+    merged = DEFAULT_CONFIG.copy()
+    merged.update(data)
+    return merged
 
-def save_config_values(values: Dict[str, Any]) -> None:
-    """Persist config values while preserving missing defaults."""
+
+def save_config(config: dict[str, Any]) -> None:
     payload = DEFAULT_CONFIG.copy()
-    payload.update(values)
-    CONFIG_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-
-
-def save_config(api_key: str, secret: str) -> None:
-    """Persist API credentials to config.json."""
-    cfg = load_config()
-    cfg["api_key"] = api_key.strip()
-    cfg["secret"] = secret.strip()
-    save_config_values(cfg)
+    payload.update(config)
+    with CONFIG_PATH.open("w", encoding="utf-8") as file:
+        json.dump(payload, file, indent=2)

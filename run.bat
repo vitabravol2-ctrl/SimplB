@@ -1,12 +1,11 @@
 @echo off
 setlocal
 
-if not exist venv\Scripts\activate (
-  echo venv not found. Please run install.bat first.
-  exit /b 1
+if not exist .venv (
+    py -3.12 -m venv .venv
 )
 
-call venv\Scripts\activate
+call .venv\Scripts\activate
+python -m pip install --upgrade pip
+pip install -r requirements.txt
 python main.py
-
-endlocal
