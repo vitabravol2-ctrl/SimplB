@@ -84,7 +84,7 @@ class MainWindow(QMainWindow):
         self.reconnect_count = 0
         self.last_error = ""
 
-        self.setWindowTitle("BTC Smart Scalper v0.1")
+        self.setWindowTitle("BTC_Smart_Scalper v0.1")
         self.setFixedSize(760, 420)
         self._build_ui()
         self._apply_theme()
@@ -97,7 +97,7 @@ class MainWindow(QMainWindow):
         self.http_timer.timeout.connect(self.update_24h_panel)
         self.http_timer.start(5000)
 
-        self.logger.info("app start")
+        self.logger.info("app start | BTC_Smart_Scalper v0.1")
         self.start_ws()
         self.update_24h_panel()
 
