@@ -1,13 +1,13 @@
 from __future__ import annotations
 
+import subprocess
 import sys
 import time
 
-from PySide6.QtCore import QTimer, Qt
-from PySide6.QtGui import QFont
+from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal
 from PySide6.QtWidgets import (
     QApplication,
-    QDialog,
+    QCheckBox,
     QFormLayout,
     QGridLayout,
     QGroupBox,
@@ -18,56 +18,34 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSpinBox,
+    QDoubleSpinBox,
+    QTabWidget,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
+from core.algorithms.base import AlgoContext
+from core.algorithms.basic_scalper import BasicScalper
 from core.binance_http import BinanceHTTP
 from core.config import load_config, save_config
-from core.logger import setup_logger
+from core.logger import LOG_PATH, setup_logger
 from core.ws_client import WSClient
 
 
-class SettingsDialog(QDialog):
-    def __init__(self, config: dict, parent=None) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("Settings")
-        self.setModal(True)
+class AccountWorker(QObject):
+    balances = Signal(dict)
 
-        self.symbol = QLineEdit(config["symbol"])
-        self.ws_url = QLineEdit(config["ws_url"])
-        self.http_endpoint = QLineEdit(config["http_endpoint"])
-        self.ui_refresh = QSpinBox()
-        self.ui_refresh.setRange(50, 5000)
-        self.ui_refresh.setValue(int(config["ui_refresh_ms"]))
+    def __init__(self, http: BinanceHTTP) -> None:
+        super().__init__()
+        self.http = http
 
-        form = QFormLayout()
-        form.addRow("Symbol", self.symbol)
-        form.addRow("WS URL", self.ws_url)
-        form.addRow("HTTP endpoint", self.http_endpoint)
-        form.addRow("Refresh UI ms", self.ui_refresh)
-
-        btn_ok = QPushButton("Save")
-        btn_cancel = QPushButton("Cancel")
-        btn_ok.clicked.connect(self.accept)
-        btn_cancel.clicked.connect(self.reject)
-
-        buttons = QHBoxLayout()
-        buttons.addStretch()
-        buttons.addWidget(btn_ok)
-        buttons.addWidget(btn_cancel)
-
-        layout = QVBoxLayout(self)
-        layout.addLayout(form)
-        layout.addLayout(buttons)
-
-    def values(self) -> dict:
-        return {
-            "symbol": self.symbol.text().strip().upper() or "BTCUSDT",
-            "ws_url": self.ws_url.text().strip(),
-            "http_endpoint": self.http_endpoint.text().strip(),
-            "ui_refresh_ms": int(self.ui_refresh.value()),
-        }
+    def poll(self) -> None:
+        try:
+            b = self.http.get_balances(["USDT", "BTC"])
+            self.balances.emit({"status": "OK", "balances": b})
+        except Exception as exc:
+            self.balances.emit({"status": f"ERROR: {exc}", "balances": {}})
 
 
 class MainWindow(QMainWindow):
@@ -75,219 +53,156 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.logger = setup_logger()
         self.config = load_config()
-        self.http = BinanceHTTP(self.config["http_endpoint"])
+        self.http = BinanceHTTP(self.config["http_endpoint"], self.config.get("api_key", ""), self.config.get("api_secret", ""))
+        self.algo = BasicScalper(self.config["algorithms"]["BasicScalper"])
+        self.last_tick = {}
+        self.last_algo_status = self.algo.get_status()
+        self.balance_data = {}
 
-        self.ws_client: WSClient | None = None
-        self.last_tick: dict = {}
-        self.last_tick_local_ms = 0
-        self.connected = False
-        self.reconnect_count = 0
-        self.last_error = ""
-
-        self.setWindowTitle("BTC_Smart_Scalper v0.1")
-        self.setFixedSize(760, 420)
+        self.setWindowTitle("BTC Smart Scalper v0.2")
+        self.resize(980, 640)
         self._build_ui()
-        self._apply_theme()
+        self.ws_client = None
 
         self.ui_timer = QTimer(self)
-        self.ui_timer.timeout.connect(self.refresh_ui)
+        self.ui_timer.timeout.connect(self.refresh_dashboard)
         self.ui_timer.start(int(self.config["ui_refresh_ms"]))
 
-        self.http_timer = QTimer(self)
-        self.http_timer.timeout.connect(self.update_24h_panel)
-        self.http_timer.start(5000)
+        self.account_thread = QThread(self)
+        self.account_worker = AccountWorker(self.http)
+        self.account_worker.moveToThread(self.account_thread)
+        self.account_worker.balances.connect(self.on_balances)
+        self.account_thread.start()
+        self.account_timer = QTimer(self)
+        self.account_timer.timeout.connect(lambda: self.account_worker.poll())
+        self.account_timer.start(int(self.config.get("account_poll_ms", 3000)))
 
-        self.logger.info("app start | BTC_Smart_Scalper v0.1")
         self.start_ws()
-        self.update_24h_panel()
+        self.logger.info("app start")
 
-    def _build_ui(self) -> None:
-        central = QWidget()
-        self.setCentralWidget(central)
-        root = QVBoxLayout(central)
-        root.setContentsMargins(10, 10, 10, 10)
-        root.setSpacing(8)
+    def _build_ui(self):
+        tabs = QTabWidget()
+        self.setCentralWidget(tabs)
 
-        mono = QFont("Consolas")
-        mono.setStyleHint(QFont.Monospace)
+        self.tab_dashboard = QWidget(); self.tab_settings = QWidget(); self.tab_algo = QWidget(); self.tab_logs = QWidget()
+        tabs.addTab(self.tab_dashboard, "Dashboard"); tabs.addTab(self.tab_settings, "Settings"); tabs.addTab(self.tab_algo, "Algorithms"); tabs.addTab(self.tab_logs, "Logs")
 
-        top = QGroupBox("TOP")
-        top_layout = QHBoxLayout(top)
-        self.lbl_status = QLabel("DISCONNECTED")
-        self.lbl_symbol = QLabel(self.config["symbol"])
-        self.lbl_ws = QLabel("WS DISCONNECTED")
-        self.lbl_age = QLabel("AGE 0 ms")
-        for w in (self.lbl_status, self.lbl_symbol, self.lbl_ws, self.lbl_age):
-            w.setFont(mono)
-            top_layout.addWidget(w)
-        top_layout.addStretch()
+        self._build_dashboard(); self._build_settings(); self._build_algo(); self._build_logs()
 
-        market = QGroupBox("MARKET")
-        mgrid = QGridLayout(market)
-        self.m_labels = {}
-        fields = ["BID", "ASK", "MID", "SPREAD", "SPREAD %", "BID QTY", "ASK QTY"]
-        for idx, key in enumerate(fields):
-            title = QLabel(key)
-            value = QLabel("-")
-            value.setFont(mono)
-            value.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            mgrid.addWidget(title, idx, 0)
-            mgrid.addWidget(value, idx, 1)
-            self.m_labels[key] = value
+    def _build_dashboard(self):
+        l = QVBoxLayout(self.tab_dashboard)
+        g = QGridLayout()
+        self.db = {k: QLabel("-") for k in ["bid","ask","mid","spread","ws","acc","usdt","btc","algo","state","act","size","tp","sl","mstep","last"]}
+        labels = ["bid","ask","mid","spread","ws","acc","usdt","btc","algo","state","act","size","tp","sl","mstep","last"]
+        for i,k in enumerate(labels): g.addWidget(QLabel(k.upper()), i, 0); g.addWidget(self.db[k], i, 1)
+        self.signal_lamp = QLabel("●")
+        g.addWidget(QLabel("SIGNAL"), len(labels), 0); g.addWidget(self.signal_lamp, len(labels), 1)
+        l.addLayout(g)
 
-        panel24 = QGroupBox("24H")
-        tgrid = QGridLayout(panel24)
-        self.t_labels = {}
-        tfields = ["LAST", "CHANGE %", "VOLUME", "QUOTE VOLUME"]
-        for idx, key in enumerate(tfields):
-            title = QLabel(key)
-            value = QLabel("-")
-            value.setFont(mono)
-            value.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            tgrid.addWidget(title, idx, 0)
-            tgrid.addWidget(value, idx, 1)
-            self.t_labels[key] = value
+    def _build_settings(self):
+        l = QVBoxLayout(self.tab_settings)
+        api = QGroupBox("API"); f=QFormLayout(api)
+        self.ed_key = QLineEdit(self.config.get("api_key","")); self.ed_sec = QLineEdit(self.config.get("api_secret","")); self.ed_sec.setEchoMode(QLineEdit.Password)
+        f.addRow("API KEY", self.ed_key); f.addRow("SECRET", self.ed_sec)
+        bsave=QPushButton("SAVE"); btest=QPushButton("TEST API"); bsave.clicked.connect(self.save_settings); btest.clicked.connect(self.test_api)
+        hb=QHBoxLayout(); hb.addWidget(bsave); hb.addWidget(btest); f.addRow(hb)
 
-        system = QGroupBox("SYSTEM")
-        sgrid = QGridLayout(system)
-        self.s_reconnect = QLabel("0")
-        self.s_error = QLabel("-")
-        self.s_latency = QLabel("0 ms")
-        for label in (self.s_reconnect, self.s_error, self.s_latency):
-            label.setFont(mono)
-        sgrid.addWidget(QLabel("WS reconnect count"), 0, 0)
-        sgrid.addWidget(self.s_reconnect, 0, 1)
-        sgrid.addWidget(QLabel("Last error"), 1, 0)
-        sgrid.addWidget(self.s_error, 1, 1)
-        sgrid.addWidget(QLabel("Latency / age"), 2, 0)
-        sgrid.addWidget(self.s_latency, 2, 1)
+        market = QGroupBox("Market"); mf=QFormLayout(market)
+        self.ed_symbol=QLineEdit(self.config["symbol"]); self.ed_http=QLineEdit(self.config["http_endpoint"]); self.ed_ws=QLineEdit(self.config["ws_url"])
+        self.sp_ui=QSpinBox(); self.sp_ui.setRange(50,5000); self.sp_ui.setValue(int(self.config["ui_refresh_ms"]))
+        mf.addRow("Symbol", self.ed_symbol); mf.addRow("HTTP endpoint", self.ed_http); mf.addRow("WS url", self.ed_ws); mf.addRow("UI refresh ms", self.sp_ui)
 
-        mid_row = QHBoxLayout()
-        mid_row.addWidget(market, 2)
-        right_col = QVBoxLayout()
-        right_col.addWidget(panel24)
-        right_col.addWidget(system)
-        mid_row.addLayout(right_col, 1)
+        account = QGroupBox("Account"); af=QFormLayout(account)
+        self.sp_poll=QSpinBox(); self.sp_poll.setRange(500,20000); self.sp_poll.setValue(int(self.config.get("account_poll_ms",3000)))
+        self.cb_show=QCheckBox(); self.cb_show.setChecked(bool(self.config.get("show_balances",True)))
+        af.addRow("account poll ms", self.sp_poll); af.addRow("show balances", self.cb_show)
+        l.addWidget(api); l.addWidget(market); l.addWidget(account); l.addStretch()
 
-        btn_start = QPushButton("START")
-        btn_stop = QPushButton("STOP")
-        btn_settings = QPushButton("SETTINGS")
-        btn_start.clicked.connect(self.start_ws)
-        btn_stop.clicked.connect(self.stop_ws)
-        btn_settings.clicked.connect(self.open_settings)
-        bottom = QHBoxLayout()
-        bottom.addStretch()
-        bottom.addWidget(btn_start)
-        bottom.addWidget(btn_stop)
-        bottom.addWidget(btn_settings)
+    def _build_algo(self):
+        l=QVBoxLayout(self.tab_algo); f=QFormLayout()
+        cfg=self.config["algorithms"]["BasicScalper"]
+        self.al_en=QCheckBox(); self.al_en.setChecked(cfg["enabled"])
+        self.al_fields={}
+        for key, val, dec in [("order_size_usdt",cfg["order_size_usdt"],2),("take_profit_usdt",cfg["take_profit_usdt"],2),("stop_loss_usdt",cfg["stop_loss_usdt"],2),("max_cycles",cfg["max_cycles"],0),("cooldown_sec",cfg["cooldown_sec"],0),("fee_bps",cfg["fee_bps"],2),("martingale_multiplier",cfg["martingale_multiplier"],2),("max_martingale_steps",cfg["max_martingale_steps"],0)]:
+            w = QDoubleSpinBox() if dec else QSpinBox();
+            (w.setDecimals(dec) if isinstance(w,QDoubleSpinBox) else None)
+            w.setValue(val); self.al_fields[key]=w
+        self.al_marti=QCheckBox(); self.al_marti.setChecked(cfg["allow_martingale"])
+        f.addRow("Algorithm", QLabel("BasicScalper")); f.addRow("enabled", self.al_en)
+        for k in ["order_size_usdt","take_profit_usdt","stop_loss_usdt","max_cycles","cooldown_sec","fee_bps"]: f.addRow(k, self.al_fields[k])
+        f.addRow("allow_martingale", self.al_marti); f.addRow("martingale_multiplier", self.al_fields["martingale_multiplier"]); f.addRow("max_martingale_steps", self.al_fields["max_martingale_steps"])
+        l.addLayout(f)
+        hb=QHBoxLayout();
+        for t,fn in [("SAVE ALGO SETTINGS",self.save_algo),("START ALGO",self.start_algo),("STOP ALGO",self.stop_algo)]:
+            b=QPushButton(t); b.clicked.connect(fn); hb.addWidget(b)
+        l.addLayout(hb)
 
-        root.addWidget(top)
-        root.addLayout(mid_row)
-        root.addStretch()
-        root.addLayout(bottom)
+    def _build_logs(self):
+        l=QVBoxLayout(self.tab_logs); self.logbox=QTextEdit(); self.logbox.setReadOnly(True)
+        b1=QPushButton("CLEAR"); b2=QPushButton("OPEN LOG FILE"); b1.clicked.connect(self.logbox.clear); b2.clicked.connect(lambda: subprocess.Popen(["xdg-open", str(LOG_PATH)]))
+        hb=QHBoxLayout(); hb.addWidget(b1); hb.addWidget(b2)
+        l.addWidget(self.logbox); l.addLayout(hb)
 
-    def _apply_theme(self) -> None:
-        self.setStyleSheet(
-            """
-            QWidget { background-color: #121417; color: #D7DCE2; font-size: 12px; }
-            QGroupBox { border: 1px solid #2D3138; border-radius: 6px; margin-top: 10px; padding: 8px; }
-            QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 4px; color: #8BB6FF; }
-            QPushButton { background-color: #1E2530; border: 1px solid #3A4658; border-radius: 4px; padding: 6px 12px; }
-            QPushButton:hover { background-color: #253042; }
-            QLineEdit, QSpinBox { background-color: #1A1E24; border: 1px solid #3A4658; }
-            """
-        )
+    def save_settings(self):
+        self.config.update({"api_key":self.ed_key.text().strip(),"api_secret":self.ed_sec.text().strip(),"symbol":self.ed_symbol.text().strip().upper(),"http_endpoint":self.ed_http.text().strip(),"ws_url":self.ed_ws.text().strip(),"ui_refresh_ms":self.sp_ui.value(),"account_poll_ms":self.sp_poll.value(),"show_balances":self.cb_show.isChecked()})
+        save_config(self.config); self.http = BinanceHTTP(self.config["http_endpoint"], self.config["api_key"], self.config["api_secret"])
 
-    def start_ws(self) -> None:
-        self.stop_ws()
-        self.ws_client = WSClient(
-            ws_url=self.config["ws_url"],
-            symbol=self.config["symbol"],
-            logger=self.logger,
-        )
+    def save_algo(self):
+        cfg=self.config["algorithms"]["BasicScalper"]; cfg["enabled"]=self.al_en.isChecked(); cfg["allow_martingale"]=self.al_marti.isChecked()
+        for k,v in self.al_fields.items(): cfg[k]=v.value()
+        save_config(self.config); self.algo = BasicScalper(cfg)
+
+    def start_algo(self): self.algo.start(); self.logger.info("algo start")
+    def stop_algo(self): self.algo.stop(); self.logger.info("algo stop")
+
+    def test_api(self):
+        try:
+            self.http.set_credentials(self.ed_key.text().strip(), self.ed_sec.text().strip())
+            self.http.test_connection(); self.logger.info("api test ok"); QMessageBox.information(self, "API", "API test OK")
+        except Exception as exc:
+            self.logger.error("api test error: %s", exc); QMessageBox.warning(self, "API", f"API test error: {exc}")
+
+    def start_ws(self):
+        self.ws_client = WSClient(self.config["ws_url"], self.config["symbol"], self.logger)
         self.ws_client.tick.connect(self.on_tick)
-        self.ws_client.status.connect(self.on_status)
         self.ws_client.start()
 
-    def stop_ws(self) -> None:
-        if self.ws_client:
-            self.ws_client.stop()
-            self.ws_client = None
-        self.connected = False
-        self.lbl_status.setText("DISCONNECTED")
-        self.lbl_ws.setText("WS DISCONNECTED")
-
-    def on_tick(self, payload: dict) -> None:
+    def on_tick(self, payload):
         self.last_tick = payload
-        self.last_tick_local_ms = int(time.time() * 1000)
-        self.connected = True
+        ctx = AlgoContext(market_data=self.last_tick, balances=self.balance_data, config=self.config, logger=self.logger)
+        new_status = self.algo.on_tick(ctx)
+        if new_status.get("planned_action") != self.last_algo_status.get("planned_action"):
+            self.logger.info("algo signal changed | %s", new_status.get("planned_action"))
+        self.last_algo_status = new_status
 
-    def on_status(self, payload: dict) -> None:
-        self.connected = bool(payload.get("connected", False))
-        self.reconnect_count = int(payload.get("reconnect_count", self.reconnect_count))
-        self.last_error = payload.get("last_error", self.last_error)
+    def on_balances(self, payload):
+        self.balance_data = payload.get("balances", {})
+        if payload.get("status","").startswith("ERROR"):
+            self.logger.error("balances update error | %s", payload["status"])
 
-    def refresh_ui(self) -> None:
-        now_ms = int(time.time() * 1000)
-        if self.last_tick:
-            age = max(0, now_ms - int(self.last_tick.get("tick_ts", now_ms)))
-            self.lbl_age.setText(f"AGE {age} ms")
-            self.s_latency.setText(f"{age} ms")
-            self.m_labels["BID"].setText(f"{self.last_tick['bid']:.2f}")
-            self.m_labels["ASK"].setText(f"{self.last_tick['ask']:.2f}")
-            self.m_labels["MID"].setText(f"{self.last_tick['mid']:.2f}")
-            self.m_labels["SPREAD"].setText(f"{self.last_tick['spread']:.2f}")
-            self.m_labels["SPREAD %"].setText(f"{self.last_tick['spread_pct']:.5f}")
-            self.m_labels["BID QTY"].setText(f"{self.last_tick['bid_qty']:.5f}")
-            self.m_labels["ASK QTY"].setText(f"{self.last_tick['ask_qty']:.5f}")
-
-        self.lbl_symbol.setText(self.config["symbol"])
-        if self.connected and (self.last_tick_local_ms and now_ms - self.last_tick_local_ms < 4000):
-            self.lbl_status.setText("CONNECTED")
-            self.lbl_status.setStyleSheet("color:#6BE28C;")
-            self.lbl_ws.setText("WS CONNECTED")
-            self.lbl_ws.setStyleSheet("color:#6BE28C;")
-        else:
-            self.lbl_status.setText("DISCONNECTED")
-            self.lbl_status.setStyleSheet("color:#FF6B6B;")
-            self.lbl_ws.setText("WS DISCONNECTED")
-            self.lbl_ws.setStyleSheet("color:#FF6B6B;")
-
-        self.s_reconnect.setText(str(self.reconnect_count))
-        self.s_error.setText(self.last_error[:60] if self.last_error else "-")
-
-    def update_24h_panel(self) -> None:
+    def refresh_dashboard(self):
+        t = self.last_tick
+        for k in ["bid","ask","mid","spread"]: self.db[k].setText(f"{float(t.get(k,0.0)):.6f}")
+        self.db["ws"].setText("CONNECTED" if t.get("connected") else "DISCONNECTED")
+        self.db["acc"].setText("OK" if self.balance_data else "NO DATA")
+        self.db["usdt"].setText(str(self.balance_data.get("USDT",{}).get("total","-")))
+        self.db["btc"].setText(str(self.balance_data.get("BTC",{}).get("total","-")))
+        s = self.last_algo_status
+        self.db["algo"].setText("BasicScalper"); self.db["state"].setText(s.get("state","-")); self.db["act"].setText(s.get("planned_action","-"))
+        self.db["size"].setText(str(s.get("current_order_size","-"))); self.db["tp"].setText(str(s.get("tp","-"))); self.db["sl"].setText(str(s.get("sl","-")))
+        self.db["mstep"].setText(str(s.get("martingale_step","-"))); self.db["last"].setText(str(s.get("last_result","-")))
+        if s.get("state") in ("READY_TO_BUY","READY_TO_SELL"): self.signal_lamp.setStyleSheet("color: yellow;")
+        elif self.balance_data and t.get("connected"): self.signal_lamp.setStyleSheet("color: green;")
+        else: self.signal_lamp.setStyleSheet("color: red;")
         try:
-            self.http.get_server_time()
-            data = self.http.get_ticker_24h(self.config["symbol"])
-            self.t_labels["LAST"].setText(f"{float(data.get('lastPrice', 0.0)):.2f}")
-            self.t_labels["CHANGE %"].setText(f"{float(data.get('priceChangePercent', 0.0)):.3f}")
-            self.t_labels["VOLUME"].setText(f"{float(data.get('volume', 0.0)):.2f}")
-            self.t_labels["QUOTE VOLUME"].setText(f"{float(data.get('quoteVolume', 0.0)):.2f}")
-        except Exception as exc:
-            self.last_error = f"HTTP: {exc}"
-
-    def open_settings(self) -> None:
-        dialog = SettingsDialog(self.config, self)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            self.config = dialog.values()
-            save_config(self.config)
-            self.http = BinanceHTTP(self.config["http_endpoint"])
-            self.ui_timer.start(int(self.config["ui_refresh_ms"]))
-            self.start_ws()
-
-    def closeEvent(self, event) -> None:
-        self.logger.info("app stop")
-        self.stop_ws()
-        super().closeEvent(event)
-
-
-def main() -> None:
-    app = QApplication(sys.argv)
-    win = MainWindow()
-    win.show()
-    sys.exit(app.exec())
+            lines = LOG_PATH.read_text(encoding="utf-8").splitlines()[-100:]
+            self.logbox.setPlainText("\n".join(lines))
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":
-    main()
+    app = QApplication(sys.argv)
+    w = MainWindow()
+    w.show()
+    sys.exit(app.exec())
